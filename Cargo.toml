@@ -1,0 +1,7 @@
+[package]
+name = "irontest"
+version = "0.1.0"
+authors = ["Simon Ask Ulsnes <su@realm.io>"]
+
+[dependencies]
+iron = "*"
