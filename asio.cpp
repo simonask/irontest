@@ -2,9 +2,11 @@
 #include "http-parser/http_parser.h"
 
 #include <iostream>
+#include <vector>
+#include <memory>
 
 using namespace asio;
-using namespace asio::ip;
+using asio::ip::tcp;
 
 struct Server {
     static constexpr size_t buffer_size = 1024;
@@ -13,20 +15,36 @@ struct Server {
     tcp::acceptor acceptor;
     tcp::socket client;
     tcp::endpoint endpoint;
-    std::unique_ptr<char[]> buffer;
-    http_parser parser;
-    http_parser_settings settings;
-    bool responding = false;
-    std::string response;
+
+    struct Client {
+        Server& server;
+        tcp::socket socket;
+        std::unique_ptr<char[]> recv_buffer;
+        std::string send_buffer;
+        bool responding = false;
+        http_parser parser;
+        http_parser_settings settings;
+
+        explicit Client(Server& server);
+        void keep_reading();
+        void close();
+        void on_message_complete();
+        void on_headers_complete();
+        void on_url(const char* url, size_t len);
+
+        static int on_message_complete(http_parser*);
+        static int on_headers_complete(http_parser*);
+        static int on_url(http_parser*, const char*, size_t);
+    };
+
+    std::unique_ptr<Client> next_client;
+    std::vector<std::unique_ptr<Client>> clients;
 
     Server() : acceptor(service, tcp::endpoint(tcp::v6(), 3004)), client(service) {
-        http_parser_settings_init(&settings);
-        settings.on_message_complete = &Server::on_message_complete;
     }
 
     void start() {
         std::cout << "Listening on port " << acceptor.local_endpoint().port() << "...\n";
-        buffer.reset(new char[buffer_size]);
         acceptor.listen(10);
         initiate_accept();
         service.run();
@@ -34,62 +52,115 @@ struct Server {
     }
 
     void initiate_accept() {
-        acceptor.async_accept(client, endpoint, [this](auto ec) {
+        next_client = std::make_unique<Client>(*this);
+        acceptor.async_accept(next_client->socket, [&](auto ec) {
             if (ec == asio::error::operation_aborted) {
                 std::cerr << "aborted\n";
                 return;
             }
-            http_parser_init(&parser, HTTP_REQUEST);
-            parser.data = this;
-            responding = true;
-            keep_reading();
-        });
-    }
-
-    void keep_reading() {
-        client.async_read_some(asio::buffer(buffer.get(), buffer_size), [this](auto ec, size_t length) {
-            if (length != 0) {
-                http_parser_execute(&parser, &settings, buffer.get(), length);
-            }
-            if (ec == asio::error::eof) {
-                http_parser_execute(&parser, &settings, nullptr, 0);
+            else if (ec) {
+                std::cerr << "accept() error: " << ec.message() << "\n";
                 return;
             }
-            else if (ec) {
-                throw std::runtime_error("Socket error");
-            }
-            else if (!responding) {
-                keep_reading();
-            }
+            next_client->keep_reading();
+            this->clients.push_back(std::move(next_client));
+            this->initiate_accept();
         });
-    }
-
-    void message_complete() {
-        responding = true;
-        std::string body = "Hello, World!";
-        std::stringstream rs;
-        rs << "HTTP/1.1 200 OK\r\n"
-                    "Server: Realm+ASIO\r\n"
-                    "Content-Length: " << body.size() << "\r\n"
-                    "Content-Type: text/plain\r\n"
-                    "\r\n";
-        rs << body << "\r\n";
-        response = rs.str();
-        client.async_write_some(asio::buffer(response), [this](auto ec, size_t) {
-            if (ec) {
-                std::cerr << "error: " << ec << "\n";
-            }
-            client.close();
-            initiate_accept();
-        });
-    }
-
-    static int on_message_complete(http_parser* parser) {
-        Server* server = static_cast<Server*>(parser->data);
-        server->message_complete();
-        return 0;
     }
 };
+
+Server::Client::Client(Server& server) : server(server), socket(server.service), recv_buffer(new char[buffer_size]) {
+    http_parser_init(&parser, HTTP_REQUEST);
+    parser.data = this;
+    http_parser_settings_init(&settings);
+    settings.on_message_complete = &Client::on_message_complete;
+    settings.on_url = &Client::on_url;
+    settings.on_headers_complete = &Client::on_headers_complete;
+}
+
+void Server::Client::keep_reading() {
+    socket.async_read_some(asio::buffer(recv_buffer.get(), buffer_size), [this](std::error_code ec, size_t len) {
+        if (ec == asio::error::operation_aborted) {
+            close();
+            return;
+        }
+        if (ec == asio::error::eof) {
+            http_parser_execute(&parser, &settings, nullptr, 0);
+            close();
+            return;
+        }
+        if (!ec) {
+            http_parser_execute(&parser, &settings, recv_buffer.get(), len);
+            if (!responding)
+                keep_reading();
+        }
+        else {
+            std::cerr << "socket error: " << ec.message() << "\n";
+            close();
+        }
+    });
+}
+
+void Server::Client::on_message_complete() {
+    responding = true;
+    const char body[] = "Hello, World!";
+    std::stringstream ss;
+    ss << "HTTP/1.1 200 OK\r\n"
+        "Server: Realm\r\n"
+        "Content-Length: " << std::strlen(body) << "\r\n"
+        "Content-Type: text/plain\r\n"
+        "\r\n" << body;
+    send_buffer = ss.str();
+    asio::async_write(socket, asio::buffer(send_buffer), [this](std::error_code ec, size_t len) {
+        responding = false;
+        if (ec == asio::error::operation_aborted) {
+            close();
+            return;
+        }
+        if (ec) {
+            std::cerr << "socket error (send): " << ec.message() << "\n";
+        }
+        if (http_should_keep_alive(&parser)) {
+            keep_reading();
+        }
+        else {
+            close();
+        }
+    });
+}
+
+void Server::Client::on_headers_complete() {
+    // std::cout << "on_headers_complete()\n";
+}
+
+void Server::Client::on_url(const char* url, size_t len) {
+    // std::cout << "on_url: " << std::string(url, len) << "\n";
+}
+
+int Server::Client::on_message_complete(http_parser* parser) {
+    static_cast<Client*>(parser->data)->on_message_complete();
+    return 0;
+}
+
+int Server::Client::on_headers_complete(http_parser* parser) {
+    static_cast<Client*>(parser->data)->on_headers_complete();
+    return 0;
+}
+
+int Server::Client::on_url(http_parser* parser, const char* url, size_t len) {
+    static_cast<Client*>(parser->data)->on_url(url, len);
+    return 0;
+}
+
+void Server::Client::close() {
+    server.service.post([this]() {
+        Server& server = this->server;
+        auto it = std::find_if(begin(server.clients), end(server.clients), [this](auto& a) { return a.get() == this; });
+        if (it != end(server.clients)) {
+            server.clients.erase(it); // suicide
+        }
+    });
+}
 
 int main(int, char**) {
     Server server;
